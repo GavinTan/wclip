@@ -3,10 +3,17 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"image"
 	"image/color"
+	"image/draw"
+	_ "image/jpeg"
+	"image/png"
 	"io"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -16,58 +23,39 @@ import (
 	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/widget"
+	log "github.com/sirupsen/logrus"
 	"golang.design/x/clipboard"
 )
 
 var (
 	title             = "ClipMonitor"
 	clipMonitorServer = "http://127.0.0.1:6233/clip"
+	timeStamp         int64
+	mu                sync.Mutex
 	isManualWrite     bool
 )
 
 type ClipData struct {
-	// windows: 1  darwin: 2  linux: 3  android: 4  ios: 5
-	Type    int    `json:"type"`
-	Content string `json:"content"`
+	Content   string `json:"content"`
+	Mime      string `json:"mime"`
+	Timestamp int64  `json:"timestamp"`
 }
 
-func localClipboardWatch() {
-	err := clipboard.Init()
-	if err != nil {
-		panic(err)
-	}
+func getData() ClipData {
+	mu.Lock()
+	defer mu.Unlock()
 
-	ch := clipboard.Watch(context.TODO(), clipboard.FmtText)
-	for data := range ch {
-		if isManualWrite {
-			isManualWrite = false
-			continue
-		}
-
-		jdata := map[string]interface{}{
-			"type":    1,
-			"content": string(data),
-		}
-
-		body, _ := json.Marshal(jdata)
-		resp, err := http.Post(clipMonitorServer, "application/json", bytes.NewBuffer(body))
-		if err != nil {
-			return
-		}
-
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-	}
-}
-
-func getClipData() ClipData {
 	resp, err := http.Get(clipMonitorServer)
 	if err != nil {
 		return ClipData{}
 	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return ClipData{}
+	}
 
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
 
 	var data ClipData
 	json.Unmarshal(body, &data)
@@ -75,20 +63,104 @@ func getClipData() ClipData {
 	return data
 }
 
-func monitorClipServer() {
+func updateData(mime, content string) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	timeStamp = time.Now().Unix()
+	data := ClipData{
+		Content:   content,
+		Mime:      mime,
+		Timestamp: timeStamp,
+	}
+
+	body, _ := json.Marshal(data)
+	resp, err := http.Post(clipMonitorServer, "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		log.Error(err)
+		return
+	}
+
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+}
+
+func localClipboardWatch(ctx context.Context) {
+	chText := clipboard.Watch(ctx, clipboard.FmtText)
+	chImage := clipboard.Watch(ctx, clipboard.FmtImage)
+	for {
+		select {
+		case data := <-chText:
+			if isManualWrite {
+				isManualWrite = false
+				continue
+			}
+
+			content := strings.TrimSpace(string(data))
+			if content != "" {
+				updateData("text/plain", content)
+			}
+		case data := <-chImage:
+			if isManualWrite {
+				isManualWrite = false
+				continue
+			}
+
+			if len(data) > 0 {
+				updateData("image/png", base64.StdEncoding.EncodeToString(data))
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func monitorClipServer(ctx context.Context) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		currentContent := clipboard.Read(clipboard.FmtText)
-		clipData := getClipData()
+	for {
+		select {
+		case <-ticker.C:
+			clipData := getData()
+			if clipData.Timestamp != timeStamp && strings.TrimSpace(clipData.Content) != "" {
+				switch clipData.Mime {
+				case "text/plain":
+					currentContent := clipboard.Read(clipboard.FmtText)
+					if clipData.Content != string(currentContent) {
+						timeStamp = clipData.Timestamp
+						isManualWrite = true
+						clipboard.Write(clipboard.FmtText, []byte(clipData.Content))
+					}
+				case "image/png":
+					isManualWrite = true
+					imgData, err := base64.StdEncoding.DecodeString(clipData.Content)
+					if err != nil {
+						log.Error(err)
+						continue
+					}
 
-		if clipData.Type > 1 && clipData.Content != "" {
-			if clipData.Content != string(currentContent) {
-				isManualWrite = true
-				clipboard.Write(clipboard.FmtText, []byte(clipData.Content))
+					img, _, _ := image.Decode(bytes.NewReader(imgData))
+					bounds := img.Bounds()
+					newImg := image.NewNRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
+					draw.Draw(newImg, newImg.Bounds(), img, bounds.Min, draw.Src)
+					buf := new(bytes.Buffer)
+					png.Encode(buf, newImg)
+
+					timeStamp = clipData.Timestamp
+					clipboard.Write(clipboard.FmtImage, buf.Bytes())
+				}
 			}
+		case <-ctx.Done():
+			return
 		}
+
+	}
+}
+
+func init() {
+	if err := clipboard.Init(); err != nil {
+		log.Fatal(err)
 	}
 }
 
@@ -117,6 +189,7 @@ func main() {
 	input := widget.NewEntry()
 	input.SetText(clipMonitorServer)
 	input.OnChanged = func(s string) {
+		clipMonitorServer = s
 		a.Preferences().SetString("clipMonitorServer", s)
 	}
 
@@ -129,10 +202,11 @@ func main() {
 
 	if desk, ok := a.(desktop.App); ok {
 		m := fyne.NewMenu("ClipMonitor",
-			fyne.NewMenuItem("Show", func() {
+			fyne.NewMenuItem("显示", func() {
 				w.Show()
 			}))
 		desk.SetSystemTrayMenu(m)
+		desk.SetSystemTrayWindow(w)
 	}
 
 	w.SetContent(content)
@@ -141,8 +215,11 @@ func main() {
 		w.Hide()
 	})
 
-	go monitorClipServer()
-	go localClipboardWatch()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go monitorClipServer(ctx)
+	go localClipboardWatch(ctx)
 
 	w.ShowAndRun()
 }

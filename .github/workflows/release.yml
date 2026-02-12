@@ -1,0 +1,68 @@
+name: build
+
+on:
+  push:
+    tags:
+      - "*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+
+      - name: Install fyne-cross
+        run: go install github.com/gavintan/fyne-cross@v1.6.1-fix
+
+      - name: Build
+        run: |
+          cd wclipClient
+          make dist
+
+      - name: Run upx
+        uses: svenstaro/upx-action@v2
+        with:
+          files: |
+            wclipClient/release/*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: wclipClient/release
+
+  publish:
+    needs: build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: wclipClient/release
+
+      - run: |
+          brew install create-dmg
+          cd wclipClient
+          make create_dmg
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v4
+        with:
+          version: latest
+          args: release --clean --skip=validate
+        env:
+          GITHUB_TOKEN: ${{ secrets.ACTION_TOKEN }}

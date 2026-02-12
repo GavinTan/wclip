@@ -1,0 +1,53 @@
+version: 2
+
+builds:
+  - id: wclip-server
+    dir: wclipServer
+    main: .
+    binary: wclipServer
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+archives:
+  - id: wclip-server
+    ids:
+      - wclip-server
+    name_template: >-
+      wclipServer-{{ .Version }}-
+      {{- .Os }}-
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "arm64" }}aarch64
+      {{- else }}{{ .Arch }}{{ end }}
+    format_overrides:
+      - goos: windows
+        format: zip
+
+checksum:
+  name_template: "{{ .ProjectName }}_sha256_checksums.txt"
+  algorithm: sha256
+  extra_files:
+    - glob: ./wclipClient/release/*
+
+changelog:
+  sort: desc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^chore:"
+      - "^test:"
+
+release:
+  github:
+    owner: gavintan
+    name: wclip
+  draft: false
+  extra_files:
+    - glob: ./wclipClient/release/*
